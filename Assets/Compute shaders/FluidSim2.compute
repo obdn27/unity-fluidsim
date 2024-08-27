@@ -1,0 +1,204 @@
+#pragma kernel CSMainRed
+#pragma kernel CSMainBlack
+
+RWTexture2D<float> xVelTexture; // Texture for x velocity (current state)
+RWTexture2D<float> yVelTexture; // Texture for y velocity (current state)
+RWTexture2D<float> xVelNextTexture; // Texture for x velocity (next state)
+RWTexture2D<float> yVelNextTexture; // Texture for y velocity (next state)
+RWTexture2D<float> divergenceTexture;
+RWTexture2D<float> divergenceNextTexture;
+RWTexture2D<float> pressureTexture;
+RWTexture2D<float> pressureNextTexture;
+RWTexture2D<float> densityTexture;
+RWTexture2D<float> densityNextTexture;
+
+float4 mousePosition;
+float2 mouseAcceleration;
+float radius;
+uint iters;
+uint gridWidth, gridHeight;
+float dt;
+float diffusionCoeff;
+float viscosity;
+
+uint2 res;
+
+uint2 Center(int2 id, in int2 res)
+{
+    return id;
+}
+uint2 Left(int2 id, in int2 res)
+{
+    return clamp(id + int2(-1, 0), 0, res - 1);
+}
+uint2 Right(int2 id, in int2 res)
+{
+    return clamp(id + int2(1, 0), 0, res - 1);
+}
+uint2 Up(int2 id, in int2 res)
+{
+    return clamp(id + int2(0, 1), 0, res - 1);
+}
+uint2 Down(int2 id, in int2 res)
+{
+    return clamp(id + int2(0, -1), 0, res - 1);
+}
+
+void ApplyMouseVelocity(inout float xVel, inout float yVel, float2 position)
+{
+    float distance = length(position - mousePosition.xy);
+    float falloff = exp(-distance / radius);
+    xVel += (mouseAcceleration.x / dt) * falloff;
+    yVel += (mouseAcceleration.y / dt) * falloff;
+}
+
+void SetBnd(RWTexture2D<float> tex, uint2 id, float b)
+{
+    float left = tex.Load(int3(Left(id, res), 0));
+    float right = tex.Load(int3(Right(id, res), 0));
+    float down = tex.Load(int3(Down(id, res), 0));
+    float up = tex.Load(int3(Up(id, res), 0));
+    float value = tex.Load(int3(id, 0));
+
+    if (id.x == 0)
+        value = (b == 2) ? -right : right;
+    if (id.x + 1 == res.x)
+        value = (b == 2) ? -left : left;
+    if (id.y == 0)
+        value = (b == 2) ? -up : up;
+    if (id.y + 1 == res.y)
+        value = (b == 2) ? -down : down;
+
+    tex[id] = value;
+}
+
+void LinSolve(RWTexture2D<float> tex, RWTexture2D<float> tex0, uint2 id, float a, float b, float c)
+{
+    float crecip = 1.0 / c;
+    for (uint i = 0; i < iters; i++)
+    {
+        float x0 = tex0[id];
+        float left = tex0[Left(id, res)];
+        float right = tex0[Right(id, res)];
+        float down = tex0[Down(id, res)];
+        float up = tex0[Up(id, res)];
+        tex[id] = (x0 + a * (left + right + up + down)) * crecip;
+    }
+    SetBnd(tex, id, b);
+}
+
+void Diffuse(RWTexture2D<float> tex, RWTexture2D<float> tex0, uint2 id, float b, float diff)
+{
+    float a = dt * diff * (res.x - 2) * (res.y - 2);
+    float c = 1.0 + 6.0 * a;
+    LinSolve(tex, tex0, id, a, b, c);
+}
+
+void Project(uint2 id)
+{
+    float xVel = xVelTexture[id];
+    float yVel = yVelTexture[id];
+
+    float leftXVel = xVelTexture[Left(id, res)];
+    float rightXVel = xVelTexture[Right(id, res)];
+    float downYVel = yVelTexture[Down(id, res)];
+    float upYVel = yVelTexture[Up(id, res)];
+
+    float divergence = -0.5 * ((rightXVel - leftXVel) + (upYVel - downYVel)) / res.x;
+    divergenceTexture[id] = divergence;
+    pressureTexture[id] = 0.0;
+
+    SetBnd(divergenceTexture, id, 0);
+    SetBnd(pressureTexture, id, 0);
+
+    LinSolve(pressureTexture, divergenceTexture, id, 1.0, 0.0, 6.0);
+
+    xVel -= 0.5 * (pressureTexture[Right(id, res)] - pressureTexture[Left(id, res)]) * res.x;
+    yVel -= 0.5 * (pressureTexture[Up(id, res)] - pressureTexture[Down(id, res)]) * res.y;
+
+    xVelNextTexture[id] = xVel;
+    yVelNextTexture[id] = yVel;
+
+    SetBnd(xVelNextTexture, id, 1);
+    SetBnd(yVelNextTexture, id, 2);
+}
+
+void Advect(RWTexture2D<float> d, RWTexture2D<float> d0, RWTexture2D<float> velocX, RWTexture2D<float> velocY, uint2 id)
+{
+    float Nfloat = gridWidth;
+    float dtx = dt * (Nfloat - 2.0);
+    float dty = dt * (Nfloat - 2.0);
+
+    float xVel = velocX[id];
+    float yVel = velocY[id];
+
+    float x = id.x - dtx * xVel;
+    float y = id.y - dty * yVel;
+
+    x = clamp(x, 0.5, Nfloat + 0.5);
+    y = clamp(y, 0.5, Nfloat + 0.5);
+
+    float i0 = floor(x);
+    float i1 = i0 + 1.0;
+    float j0 = floor(y);
+    float j1 = j0 + 1.0;
+
+    float s1 = x - i0;
+    float s0 = 1.0 - s1;
+    float t1 = y - j0;
+    float t0 = 1.0 - t1;
+
+    int i0i = (int) i0;
+    int i1i = (int) i1;
+    int j0i = (int) j0;
+    int j1i = (int) j1;
+
+    d[id] =
+        s0 * (t0 * d0[uint2(i0i, j0i)] + t1 * d0[uint2(i0i, j1i)]) +
+        s1 * (t0 * d0[uint2(i1i, j0i)] + t1 * d0[uint2(i1i, j1i)]);
+}
+
+void CSMain(uint2 id)
+{
+    uint2 res = uint2(gridWidth, gridHeight);
+    float2 position = float2(id.x, id.y);
+
+    float xVel = xVelTexture[id];
+    float yVel = yVelTexture[id];
+
+    ApplyMouseVelocity(xVel, yVel, position);
+
+    xVelTexture[id] = xVel;
+    yVelTexture[id] = yVel;
+
+    //Diffuse(xVelNextTexture, xVelTexture, id, 1.0, viscosity);
+    //Diffuse(yVelNextTexture, yVelTexture, id, 2.0, viscosity);
+
+    Project(id);
+    
+    //Advect(xVelNextTexture, xVelTexture, xVelTexture, yVelTexture, id);
+    //Advect(yVelNextTexture, yVelTexture, xVelTexture, yVelTexture, id);
+
+    //Project(id);
+    
+    //Diffuse(sTexture, densityTexture, id, 1, diffusionCoeff);
+    //Advect(densityTexture, sTexture, xVelTexture, yVelTexture, id);
+}
+
+[numthreads(8, 8, 1)]
+void CSMainRed(uint3 id : SV_DispatchThreadID)
+{
+    if ((id.x + id.y) % 2 == 0)
+    {
+        CSMain(id.xy);
+    }
+}
+
+[numthreads(8, 8, 1)]
+void CSMainBlack(uint3 id : SV_DispatchThreadID)
+{
+    if ((id.x + id.y) % 2 == 1)
+    {
+        CSMain(id.xy);
+    }
+}

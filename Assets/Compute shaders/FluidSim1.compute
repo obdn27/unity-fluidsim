@@ -1,0 +1,197 @@
+#pragma kernel CSMainRed
+#pragma kernel CSMainBlack
+
+RWTexture2D<float4> velocityTexture; // Use a RWTexture2D for velocity storage
+float4 mousePosition;
+float2 mouseAcceleration;
+float radius;
+uint gridWidth, gridHeight;
+float dt;
+
+void ApplyMouseVelocity(inout float4 velocity, float2 position)
+{
+    // Compute distance from mouse position
+    float distance = length(position - mousePosition.xy);
+    
+    // Compute exponential falloff factor
+    float falloff = exp(-distance / radius);
+
+    // Apply mouse acceleration with falloff
+    velocity.xy += (mouseAcceleration / dt) * falloff;
+}
+
+int2 Center(int2 id, in int2 res)
+{
+    return id;
+}
+
+int2 Left(int2 id, in int2 res)
+{
+    id = clamp(id + int2(-1, 0), 0, res - 1);
+    return id;
+}
+
+int2 Right(int2 id, in int2 res)
+{
+    id = clamp(id + int2(1, 0), 0, res - 1);
+    return id;
+}
+
+int2 Up(int2 id, in int2 res)
+{
+    id = clamp(id + int2(0, 1), 0, res - 1);
+    return id;
+}
+
+int2 Down(int2 id, in int2 res)
+{
+    id = clamp(id + int2(0, -1), 0, res - 1);
+    return id;
+}
+
+int2 TopRight(int2 id, in int2 res)
+{
+    id = clamp(id + int2(1, 1), 0, res - 1);
+    return id;
+}
+
+uint GetFluidNeighbors(float2 pos)
+{
+    uint fluidNeighbors = 4; // Assume 4 neighbors by default
+    
+    // Check if the cell is at the left or right border
+    if (pos.x == 1 || pos.x == gridWidth - 2)
+    {
+        fluidNeighbors--;
+    }
+
+    // Check if the cell is at the top or bottom border
+    if (pos.y == 1 || pos.y == gridHeight - 2)
+    {
+        fluidNeighbors--;
+    }
+
+    return fluidNeighbors;
+}
+
+float2 BilinearInterpolation(float2 pos, int2 res)
+{
+    // Floor position to get the bottom-left grid point
+    int2 p0 = int2(floor(pos));
+    
+    // Get the fractional part of the position
+    float2 f = frac(pos);
+    
+    // Sample the four nearest grid points (clamp to texture boundaries)
+    float2 v00 = velocityTexture[Center(p0, res)].xy; // Bottom-left
+    float2 v10 = velocityTexture[Right(p0, res)].xy; // Bottom-right
+    float2 v01 = velocityTexture[Up(p0, res)].xy; // Top-left
+    float2 v11 = velocityTexture[TopRight(p0, res)].xy; // Top-right
+
+    // Perform bilinear interpolation
+    float2 v0 = lerp(v00, v10, f.x); // Interpolate along the x-axis
+    float2 v1 = lerp(v01, v11, f.x); // Interpolate along the x-axis
+    float2 result = lerp(v0, v1, f.y); // Interpolate along the y-axis
+
+    return result;
+}
+
+float2 BilinearInterpolateProps(float2 position)
+{
+    int2 intparts = int2(position);
+    float2 fracs = frac(position);
+    float2 v0 = lerp(velocityTexture[intparts].xy, velocityTexture[intparts + int2(1, 0)].xy, fracs.x);
+    float2 v1 = lerp(velocityTexture[intparts + int2(0, 1)].xy, velocityTexture[intparts + int2(1, 1)].xy, fracs.x);
+    
+    return lerp(v0, v1, fracs.y);
+}
+
+void CSMain(uint2 id)
+{
+    uint index = id.y * gridWidth + id.x;
+    uint2 res = uint2(gridWidth, gridHeight);
+    float2 position = float2(id.x, id.y);
+    
+    if (position.x <= 0 || position.y <= 0 || position.x >= gridWidth - 1 || position.y >= gridHeight - 1)
+        return;
+    
+    float4 center = velocityTexture[Center(id, res)];
+    float4 left = velocityTexture[Left(id, res)];
+    float4 right = velocityTexture[Right(id, res)];
+    float4 up = velocityTexture[Up(id, res)];
+    float4 down = velocityTexture[Down(id, res)];
+    
+    // Semi-lagrangian advection
+    // First backtrace using the current velocity
+    float2 backtracePos = position - center.xy * dt;
+    backtracePos = clamp(backtracePos, 0, res - 1);
+    //center.xy += BilinearInterpolation(backtracePos, res);
+    center.xy = BilinearInterpolateProps(backtracePos);
+    
+    ApplyMouseVelocity(center, position);
+    
+    uint numFluidNeighbors = GetFluidNeighbors(position);
+    if (numFluidNeighbors == 0)
+        return;
+    
+    float divergence = -center.x + right.x - center.y + up.y;
+    float dvel = divergence / numFluidNeighbors;
+    
+    // Check and update horizontal velocity if not at a wall
+    if (position.x > 1)
+    {
+        // Left neighbor is within fluid (not a wall)
+        center.x += dvel;
+    }
+    if (position.x < gridWidth - 2)
+    {
+        // Right neighbor is within fluid (not a wall)
+        right.x -= dvel;
+    }
+
+    // Check and update vertical velocity if not at a wall
+    if (position.y > 1)
+    {
+        // Bottom neighbor is within fluid (not a wall)
+        center.y += dvel;
+    }
+    if (position.y < gridHeight - 2)
+    {
+        // Top neighbor is within fluid (not a wall)
+        up.y -= dvel;
+    }
+    
+    right *= 0.99;
+    up *= 0.99;
+    center *= 0.99;
+    
+    velocityTexture[Right(id, res)] = right;
+    velocityTexture[Up(id, res)] = up;
+    velocityTexture[Center(id, res)] = center;
+}
+
+[numthreads(8, 8, 1)]
+void CSMainRed(uint3 id : SV_DispatchThreadID)
+{
+    uint x = id.x;
+    uint y = id.y;
+
+    // Only process "red" cells
+    if ((x + y) % 2 == 0)
+    {
+        CSMain(id.xy);
+    }
+}
+
+[numthreads(8, 8, 1)]
+void CSMainBlack(uint3 id : SV_DispatchThreadID)
+{
+    uint x = id.x;
+    uint y = id.y;
+
+    // Only process "black" cells
+    if ((x + y) % 2 == 1)
+    {
+        CSMain(id.xy);
+    }
+}

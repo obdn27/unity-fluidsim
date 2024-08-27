@@ -1,0 +1,279 @@
+#pragma kernel AddMouseVelocityAndAdvection
+#pragma kernel Diffuse
+#pragma kernel ComputeDivergence
+#pragma kernel SolvePressure
+#pragma kernel ApplyCorrection
+
+RWTexture2D<float> xVelTexture; // x velocity
+RWTexture2D<float> yVelTexture; // y velocity
+RWTexture2D<float> densityTexture;  // Density of ink
+RWTexture2D<float> pressureTexture; // Pressure
+RWTexture2D<float> divergenceTexture; // Divergence
+
+uint2 res; // Resolution of the grid
+float dt; // Delta time
+float radius; // Radius for mouse influence
+float2 mousePosition; // Mouse position in grid space
+float2 mouseAcceleration; // Mouse acceleration vector
+float damping, densityDamping;
+float diffusionCoeff;
+float viscosity;
+
+void SetBoundaryConditions(RWTexture2D<float> xVelTex, RWTexture2D<float> yVelTex, uint2 res)
+{
+    // Apply boundary conditions for the left and right walls
+    for (uint y = 0; y < res.y; y++)
+    {
+        // Left wall: set x velocity to zero
+        xVelTex[uint2(0, y)] = 0.0;
+        // Right wall: set x velocity to zero
+        xVelTex[uint2(res.x - 1, y)] = 0.0;
+    }
+
+    // Apply boundary conditions for the top and bottom walls
+    for (uint x = 0; x < res.x; x++)
+    {
+        // Bottom wall: set y velocity to zero
+        yVelTex[uint2(x, 0)] = 0.0;
+        // Top wall: set y velocity to zero
+        yVelTex[uint2(x, res.y - 1)] = 0.0;
+    }
+
+    // Handle the corners (both x and y velocities should be zero)
+    xVelTex[uint2(0, 0)] = 0.0;
+    yVelTex[uint2(0, 0)] = 0.0;
+
+    xVelTex[uint2(res.x - 1, 0)] = 0.0;
+    yVelTex[uint2(res.x - 1, 0)] = 0.0;
+
+    xVelTex[uint2(0, res.y - 1)] = 0.0;
+    yVelTex[uint2(0, res.y - 1)] = 0.0;
+
+    xVelTex[uint2(res.x - 1, res.y - 1)] = 0.0;
+    yVelTex[uint2(res.x - 1, res.y - 1)] = 0.0;
+}
+
+float BilinearInterpolation(RWTexture2D<float> tex, float2 position)
+{
+    // Extract integer and fractional components of the position
+    float2 floorPos = floor(position);
+    float2 fracpart = position - floorPos;
+
+    uint2 i0 = (uint2) floorPos;
+    uint2 i1 = clamp(i0 + uint2(1, 0), 0, res - 1);
+    uint2 j0 = clamp(i0 + uint2(0, 1), 0, res - 1);
+
+    // Sample the four nearest texels
+    float value00 = tex[i0];
+    float value10 = tex[i1];
+    float value01 = tex[j0];
+    float value11 = tex[clamp(i0 + uint2(1, 1), 0, res - 1)];
+
+    // Symmetrically perform bilinear interpolation
+    float lerpX0 = lerp(value00, value10, fracpart.x);
+    float lerpX1 = lerp(value01, value11, fracpart.x);
+
+    return lerp(lerpX0, lerpX1, fracpart.y);
+}
+
+// Kernel to apply mouse velocity, advect velocities, and compute divergence
+[numthreads(8, 8, 1)]
+void AddMouseVelocityAndAdvection(uint3 id3 : SV_DispatchThreadID)
+{
+    uint2 id = id3.xy;
+
+    if (id.x >= res.x || id.y >= res.y)
+        return;
+
+    float2 pos = float2(id.x, id.y);
+    float dist = distance(pos, mousePosition);
+
+    if (dist < radius)
+    {
+        float falloff = 1.0 - dist / radius;
+        float xVel = xVelTexture[id];
+        float yVel = yVelTexture[id];
+        
+        xVel += mouseAcceleration.x * falloff;
+        yVel += mouseAcceleration.y * falloff;
+
+        xVelTexture[id] = xVel;
+        yVelTexture[id] = yVel; 
+        
+        // Inject density based on mouse input
+        float density = densityTexture[id];
+        density += 100.0 * falloff * dt; // Adjust the amount of density injected
+        densityTexture[id] = density;
+    }
+
+    // Backtrace and advection with symmetrical position handling
+    float xVelCurrent = xVelTexture[id];
+    float yVelCurrent = yVelTexture[id];
+
+    float2 backtrackedPos = pos - dt * float2(xVelCurrent, yVelCurrent);
+    backtrackedPos = clamp(backtrackedPos, 0.5, res - 1.5);
+
+    float advectedXVel = BilinearInterpolation(xVelTexture, backtrackedPos);
+    float advectedYVel = BilinearInterpolation(yVelTexture, backtrackedPos);
+    
+    float advectedDensity = BilinearInterpolation(densityTexture, backtrackedPos);
+
+    // Update density field with advected value
+    densityTexture[id] = advectedDensity;
+
+    xVelTexture[id] = advectedXVel;
+    yVelTexture[id] = advectedYVel;
+}
+
+// Kernel for diffusion with iterative Jacobi smoothing
+//[numthreads(8, 8, 1)]
+//void Diffuse(uint3 id3 : SV_DispatchThreadID)
+//{
+//    uint2 id = id3.xy;
+    
+//    if (id.x >= res.x || id.y >= res.y)
+//        return;
+
+//    // Fetch neighboring velocities for x
+//    float vLeftX = xVelTexture[clamp(id - uint2(1, 0), uint2(0, 0), res - 1)];
+//    float vRightX = xVelTexture[clamp(id + uint2(1, 0), uint2(0, 0), res - 1)];
+//    float vUpX = xVelTexture[clamp(id + uint2(0, 1), uint2(0, 0), res - 1)];
+//    float vDownX = xVelTexture[clamp(id - uint2(0, 1), uint2(0, 0), res - 1)];
+//    float currentX = xVelTexture[id];
+
+//    // Apply Jacobi iteration for x velocity diffusion
+//    float newVelX = (currentX + viscosity * dt * (vLeftX + vRightX + vUpX + vDownX)) / (1 + 4 * viscosity * dt);
+//    xVelTexture[id] = newVelX;
+
+//    // Fetch neighboring velocities for y
+//    float vLeftY = yVelTexture[clamp(id - uint2(1, 0), uint2(0, 0), res - 1)];
+//    float vRightY = yVelTexture[clamp(id + uint2(1, 0), uint2(0, 0), res - 1)];
+//    float vUpY = yVelTexture[clamp(id + uint2(0, 1), uint2(0, 0), res - 1)];
+//    float vDownY = yVelTexture[clamp(id - uint2(0, 1), uint2(0, 0), res - 1)];
+//    float currentY = yVelTexture[id];
+
+//    // Apply Jacobi iteration for y velocity diffusion
+//    float newVelY = (currentY + viscosity * dt * (vLeftY + vRightY + vUpY + vDownY)) / (1 + 4 * viscosity * dt);
+//    yVelTexture[id] = newVelY;
+//}
+
+[numthreads(8, 8, 1)]
+void Diffuse(uint3 id3 : SV_DispatchThreadID)
+{
+    uint2 id = id3.xy;
+    
+    float currentVelX = xVelTexture[id];
+    float currentVelY = yVelTexture[id];
+    float currentd = densityTexture[id];
+    
+    // Fetch neighboring velocities for x
+    float vLeftX = xVelTexture[clamp(id - uint2(1, 0), uint2(0, 0), res - 1)];
+    float vRightX = xVelTexture[clamp(id + uint2(1, 0), uint2(0, 0), res - 1)];
+    float vUpX = xVelTexture[clamp(id + uint2(0, 1), uint2(0, 0), res - 1)];
+    float vDownX = xVelTexture[clamp(id - uint2(0, 1), uint2(0, 0), res - 1)];
+    float currentX = xVelTexture[id];
+    
+    float avgX = (vLeftX + vRightX + vUpX + vDownX) / 4;
+    
+    // Fetch neighboring velocities for y
+    float vLeftY = yVelTexture[clamp(id - uint2(1, 0), uint2(0, 0), res - 1)];
+    float vRightY = yVelTexture[clamp(id + uint2(1, 0), uint2(0, 0), res - 1)];
+    float vUpY = yVelTexture[clamp(id + uint2(0, 1), uint2(0, 0), res - 1)];
+    float vDownY = yVelTexture[clamp(id - uint2(0, 1), uint2(0, 0), res - 1)];
+    float currentY = yVelTexture[id];
+    
+    float avgY = (vLeftY + vRightY + vUpY + vDownY) / 4;
+    
+    float dLeft = densityTexture[clamp(id - uint2(1, 0), uint2(0, 0), res - 1)];
+    float dRight = densityTexture[clamp(id + uint2(1, 0), uint2(0, 0), res - 1)];
+    float dUp = densityTexture[clamp(id + uint2(0, 1), uint2(0, 0), res - 1)];
+    float dDown = densityTexture[clamp(id - uint2(0, 1), uint2(0, 0), res - 1)];
+    float dc = densityTexture[id];
+    
+    float avgd = (dLeft + dRight + dUp + dDown) / 4;
+    
+    float newVelX = currentVelX + (avgX - currentVelX) * (1 - exp(-viscosity));
+    float newVelY = currentVelY + (avgY - currentVelY) * (1 - exp(-viscosity));
+    float newd = currentd + (avgd - currentd) * (1 - exp(-diffusionCoeff));
+    
+    xVelTexture[id] = newVelX;
+    yVelTexture[id] = newVelY;
+    densityTexture[id] = newd;
+}
+
+// Kernel for computing divergence after diffusion
+[numthreads(8, 8, 1)]
+void ComputeDivergence(uint3 id3 : SV_DispatchThreadID)
+{
+    uint2 id = id3.xy;
+    
+    if (id.x >= res.x || id.y >= res.y)
+        return;
+
+    // Compute divergence of the velocity field after diffusion
+    float vRightX = xVelTexture[clamp(id + uint2(1, 0), uint2(0, 0), res - 1)];
+    float vLeftX = xVelTexture[clamp(id - uint2(1, 0), uint2(0, 0), res - 1)];
+    float vUpY = yVelTexture[clamp(id + uint2(0, 1), uint2(0, 0), res - 1)];
+    float vDownY = yVelTexture[clamp(id - uint2(0, 1), uint2(0, 0), res - 1)];
+    
+    float divergence = (vRightX - vLeftX) + (vUpY - vDownY);
+    divergenceTexture[id] = divergence;
+
+    // Reset the pressure for the solver
+    pressureTexture[id] = 0.0;
+}
+
+// Kernel to iteratively solve for pressure
+[numthreads(8, 8, 1)]
+void SolvePressure(uint3 id3 : SV_DispatchThreadID)
+{
+    uint2 id = id3.xy;
+
+    if (id.x >= res.x || id.y >= res.y)
+        return;
+
+    // Read pressures at neighboring cells
+    float pressureLeft = pressureTexture[clamp(id - uint2(1, 0), uint2(0, 0), res - 1)];
+    float pressureRight = pressureTexture[clamp(id + uint2(1, 0), uint2(0, 0), res - 1)];
+    float pressureUp = pressureTexture[clamp(id + uint2(0, 1), uint2(0, 0), res - 1)];
+    float pressureDown = pressureTexture[clamp(id - uint2(0, 1), uint2(0, 0), res - 1)];
+
+    // Solve pressure at the current cell
+    float newPressure = (pressureLeft + pressureRight + pressureUp + pressureDown - divergenceTexture[id]) * 0.25;
+
+    // Write back the updated pressure
+    pressureTexture[id] = newPressure;
+}
+
+// Kernel to apply the correction based on the computed pressure
+[numthreads(8, 8, 1)]
+void ApplyCorrection(uint3 id3 : SV_DispatchThreadID)
+{
+    uint2 id = id3.xy;
+
+    if (id.x >= res.x || id.y >= res.y)
+        return;
+    
+    SetBoundaryConditions(xVelTexture, yVelTexture, res);
+
+    // Read pressures at neighboring cells
+    float pressureRight = pressureTexture[clamp(id + uint2(1, 0), uint2(0, 0), res - 1)];
+    float pressureLeft = pressureTexture[clamp(id - uint2(1, 0), uint2(0, 0), res - 1)];
+    float pressureUp = pressureTexture[clamp(id + uint2(0, 1), uint2(0, 0), res - 1)];
+    float pressureDown = pressureTexture[clamp(id - uint2(0, 1), uint2(0, 0), res - 1)];
+    
+    pressureTexture[id] = 0.0;
+
+    // Correct velocity by subtracting pressure gradient
+    float xVel = xVelTexture[id] - 0.5 * (pressureRight - pressureLeft);
+    float yVel = yVelTexture[id] - 0.5 * (pressureUp - pressureDown);
+
+    // Apply damping factor to velocities to stabilize the system
+    xVel *= damping;
+    yVel *= damping;
+    densityTexture[id] *= densityDamping;
+
+    // Write back the corrected velocities
+    xVelTexture[id] = xVel;
+    yVelTexture[id] = yVel;
+}
